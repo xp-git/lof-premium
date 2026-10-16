@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LOF 基金溢价监控 · 全部A股LOF</title>
+<style>
+:root{
+  --up:#d32f2f; --down:#2e7d32; --flat:#666;
+  --border:#e0e0e0; --bg:#f7f8fa; --head:#f0f2f5;
+}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:#222}
+.topbar{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:12px 16px;background:#fff;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:5}
+.topbar h1{font-size:17px;margin:0 8px 0 0}
+.topbar input[type=text]{padding:6px 10px;border:1px solid var(--border);border-radius:6px;width:200px;outline:none}
+.topbar input[type=text]:focus{border-color:#1a73e8}
+button{padding:6px 14px;border:1px solid var(--border);border-radius:6px;background:#fff;cursor:pointer}
+button:hover{background:#f5f5f5}
+button.primary{background:#1a73e8;color:#fff;border-color:#1a73e8}
+button.primary:hover{background:#1557b0}
+button:disabled{opacity:.5;cursor:not-allowed}
+.hint{color:#888;font-size:12px;margin-left:auto}
+.wrap{padding:12px 16px}
+table{border-collapse:collapse;width:100%;background:#fff;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+th,td{padding:7px 10px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--border)}
+th{background:var(--head);cursor:pointer;user-select:none;font-weight:600;position:sticky;top:56px;z-index:4}
+th:hover{background:#e6e9ee}
+th:first-child,td:first-child{text-align:center}
+th:nth-child(2),td:nth-child(2){text-align:left}
+tbody tr:hover{background:#f5f9ff;cursor:pointer}
+.up{color:var(--up)} .down{color:var(--down)} .flat{color:var(--flat)}
+.status{padding:6px 16px;color:#555;font-size:13px}
+.progress{height:4px;background:#eee}
+.progress>div{height:100%;width:0;background:#1a73e8;transition:width .3s}
+.modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:20}
+.modal-bg.show{display:flex;align-items:center;justify-content:center}
+.modal{background:#fff;border-radius:10px;padding:20px 24px;min-width:340px;max-width:90vw;max-height:80vh;overflow:auto}
+.modal h3{margin:0 0 10px;font-size:16px}
+.modal table{margin:0}
+.modal td{border-bottom:1px dashed #eee;text-align:left}
+.modal td:first-child{color:#888;text-align:left;width:110px}
+.footer{padding:10px 16px 24px;color:#999;font-size:12px}
+@media(max-width:800px){th,td{padding:5px 6px;font-size:12px}}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <h1>LOF 基金溢价监控</h1>
+  <input type="text" id="search" placeholder="搜索代码 / 名称">
+  <button class="primary" id="btnRefresh">刷新数据</button>
+  <label><input type="checkbox" id="autoRefresh"> 自动刷新
+  <input type="number" id="interval" value="60" min="15" max="600" style="width:56px;padding:4px;border:1px solid var(--border);border-radius:4px"> 秒</label>
+  <span class="hint">红=溢价 绿=折价 | 点击表头排序 | 点击行看详情</span>
+</div>
+<div class="progress"><div id="pbar"></div></div>
+<div class="status" id="status">点击「刷新数据」开始拉取（首次约 30~90 秒，取决于网络）</div>
+<div class="wrap" style="overflow-x:auto">
+<table id="tbl">
+<thead><tr>
+  <th data-k="code">代码</th>
+  <th data-k="name">名称</th>
+  <th data-k="price">现价</th>
+  <th data-k="nav">净值</th>
+  <th data-k="gsz">估算净值</th>
+  <th data-k="prem">溢价/估算</th>
+  <th data-k="prem3">三日均溢</th>
+  <th data-k="amount">成交额(取整)</th>
+  <th data-k="exp_ret">预计收益率</th>
+  <th data-k="exp_amt">预计收益额</th>
+</tr></thead>
+<tbody id="tbody"></tbody>
+</table>
+</div>
+<div class="footer">数据来源：东方财富 / 天天基金公开接口，可能有延迟或误差，仅供研究参考，不构成投资建议。GitHub Pages 静态部署 · 数据在浏览器本地实时计算。</div>
+
+<div class="modal-bg" id="modalBg"><div class="modal" id="modalBox"></div></div>
+
+<script>
+"use strict";
+// ============================================================ 数据层
+const HEAD = {code:"代码",name:"名称",price:"现价",nav:"净值",gsz:"估算净值",prem:"溢价/估算",prem3:"三日均溢",amount:"成交额",exp_ret:"预计收益率",exp_amt:"预计收益额"};
+let rows = [];            // 全部数据
+let sortK = "prem", sortDesc = true;
+let loading = false, autoTimer = null;
+
+// ---- 通用 JSONP（cbName 指定回调参数名，东财行情用 cb，fundmobapi 用 callback）----
+let jsonpSeq = 0;
+function jsonp(url, cbName){
+  cbName = cbName || "callback";
+  return new Promise((resolve, reject)=>{
+    const cb = "_cb"+(++jsonpSeq)+"_"+Date.now();
+    window[cb] = function(data){ resolve(data); cleanup(); };
+    const s = document.createElement("script");
+    const timer = setTimeout(()=>{ reject(new Error("timeout")); cleanup(); }, 20000);
+    function cleanup(){ clearTimeout(timer); delete window[cb]; s.remove(); }
+    s.onerror = ()=>{ reject(new Error("network")); cleanup(); };
+    s.src = url + (url.includes("?") ? "&" : "?") + cbName + "=" + cb;
+    document.head.appendChild(s);
+  });
+}
+
+// ---- 1. LOF 实时行情列表 ----
+async function fetchSpot(){
+  const out = [];
+  for(let pn=1; pn<=5; pn++){
+    const u = "https://push2.eastmoney.com/api/qt/clist/get?pn="+pn+"&pz=500&po=1&np=1&fltt=2&invt=2&fid=f6"
+      + "&fs=b:MK0404,b:MK0405,b:MK0406,b:MK0407&fields=f12,f13,f14,f2,f3,f6,f18";
+    const d = await jsonp(u, "cb");
+    const diff = (d.data && d.data.diff) || [];
+    diff.forEach(x=>out.push({
+      code:x.f12, mkt:x.f13, name:x.f14,
+      price:num(x.f2), amount:num(x.f6)
+    }));
+    if(out.length >= (d.data && d.data.total || 0)) break;
+  }
+  return out;
+}
+
+// ---- 2. 最新净值（批量，50 只/请求）----
+async function fetchNavBatch(codes){
+  const map = {};
+  for(let i=0;i<codes.length;i+=50){
+    const u = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo?plat=Android&appType=ttjj&product=EFund&Version=6.2.8&deviceid=1&Fcodes="+codes.slice(i,i+50).join(",");
+    try{
+      const d = await jsonp(u);
+      (d.Datas||[]).forEach(f=>{
+        if(f.NAV) map[f.FCODE] = {nav:+f.NAV, date:f.PDATE||"", sgzt:f.SGZT||"", shzt:f.SHZT||""};
+      });
+    }catch(e){}
+  }
+  return map;
+}
+
+// ---- 3. 估算净值（fundgz，脚本原生跨域）----
+function fetchGz(code){
+  return new Promise(resolve=>{
+    const cb = "jsonpgz";
+    const old = window[cb];
+    const s = document.createElement("script");
+    const timer = setTimeout(()=>{ window[cb]=old; s.remove(); resolve(null); }, 8000);
+    window[cb] = function(d){
+      clearTimeout(timer); window[cb]=old; s.remove();
+      resolve(d && d.gsz ? {gsz:+d.gsz, time:d.gztime||""} : null);
+    };
+    s.onerror = ()=>{ clearTimeout(timer); window[cb]=old; s.remove(); resolve(null); };
+    s.src = "https://fundgz.1234567.com.cn/js/"+code+".js";
+    document.head.appendChild(s);
+  });
+}
+
+// ---- 4. 历史净值 / 日K（三日均溢用）----
+async function fetchHistNav(code){
+  const u = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNHisNetList?FCODE="+code+"&pageIndex=1&pageSize=8&plat=Android&appType=ttjj&product=EFund&Version=6.2.8&deviceid=1";
+  try{
+    const d = await jsonp(u);
+    return (d.Datas||[]).map(x=>({date:x.FSRQ, nav:+x.DWJZ})).filter(x=>!!x.nav);
+  }catch(e){ return []; }
+}
+async function fetchKline(secid){
+  const u = "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid="+secid+"&klt=101&fqt=0&lmt=8&end=20500101&fields1=f1&fields2=f51,f53";
+  try{
+    const d = await jsonp(u, "cb");
+    return ((d.data&&d.data.klines)||[]).slice().reverse().map(l=>{const p=l.split(",");return {date:p[0], close:+p[1]};});
+  }catch(e){ return []; }
+}
+
+function num(v){ return (v===null||v===undefined||v==="-") ? null : +v; }
+
+// ---- 并发池 ----
+async function pool(items, worker, size, onDone){
+  let i = 0, done = 0;
+  async function next(){
+    while(i < items.length){
+      const k = i++;
+      try{ await worker(items[k], k); }catch(e){}
+      done++; onDone && onDone(done, items.length);
+    }
+  }
+  await Promise.all(Array.from({length:Math.min(size,items.length)}, next));
+}
+
+// ============================================================ 主流程
+async function refresh(){
+  if(loading) return;
+  loading = true;
+  const btn = document.getElementById("btnRefresh");
+  btn.disabled = true;
+  const st = msg=>document.getElementById("status").textContent = msg;
+  const pb = v=>document.getElementById("pbar").style.width = v+"%";
+  try{
+    st("正在获取 LOF 列表 ...");
+    const spot = await fetchSpot();
+    if(!spot.length) throw new Error("未获取到 LOF 列表");
+    pb(5);
+
+    st("正在获取净值（批量）...");
+    const navMap = await fetchNavBatch(spot.map(f=>f.code));
+    pb(15);
+
+    rows = spot.map(f=>{
+      const n = navMap[f.code] || {};
+      return {code:f.code, mkt:f.mkt, name:f.name, price:f.price, amount:f.amount,
+              nav:n.nav||null, nav_date:n.date||"", sgzt:n.sgzt||"", shzt:n.shzt||"",
+              gsz:null, gztime:"", histNav:[], kline:[], prem3:null};
+    });
+
+    // 每只基金：估算净值 + 历史净值 + 日K
+    await pool(rows, async r=>{
+      const [gz, hn, kl] = await Promise.all([
+        fetchGz(r.code), fetchHistNav(r.code), fetchKline(r.mkt+"."+r.code)
+      ]);
+      if(gz){ r.gsz = gz.gsz; r.gztime = gz.time; }
+      r.histNav = hn; r.kline = kl;
+    }, 12, (d,t)=>{ st("拉取数据中 ... "+d+" / "+t); pb(15 + 85*d/t); });
+
+    calc();
+    render();
+    pb(100);
+    st("完成：共 "+rows.length+" 只 LOF · 更新于 "+new Date().toLocaleTimeString("zh-CN"));
+  }catch(e){
+    st("刷新失败："+e.message+"（网络受限或接口变动，稍后重试）");
+  }
+  btn.disabled = false;
+  loading = false;
+}
+
+// ---- 指标计算 ----
+function calc(){
+  rows.forEach(r=>{
+    r.prem_nav = (r.price && r.nav) ? r.price/r.nav - 1 : null;
+    r.prem_est = (r.price && r.gsz) ? r.price/r.gsz - 1 : null;
+    // 三日均溢：最近3个交易日 (收盘/当日净值-1) 均值
+    const navByDate = {}; r.histNav.forEach(h=>navByDate[h.date]=h.nav);
+    const ps = r.kline.slice(0,3).filter(k=>navByDate[k.date]).map(k=>k.close/navByDate[k.date]-1);
+    r.prem3 = ps.length ? ps.reduce((a,b)=>a+b,0)/ps.length : null;
+    const base = r.gsz || r.nav;
+    r.exp_ret = (r.price && base) ? base/r.price - 1 : null;
+    r.exp_amt = r.exp_ret===null ? null : r.exp_ret*10000;
+  });
+}
+
+// ============================================================ 渲染
+function fmtPct(v){ return v===null||v===undefined ? "--" : (v*100).toFixed(2)+"%"; }
+function fmtP(v){ return v===null||v===undefined ? "--" : v.toFixed(3); }
+function fmtAmt(v){
+  if(v===null||v===undefined) return "--";
+  if(v>=1e8) return (v/1e8).toFixed(2)+"亿";
+  return Math.round(v/1e4)+"万";
+}
+function color(v){ return v>1e-9 ? "up" : v<-1e-9 ? "down" : "flat"; }
+
+function sortVal(r, k){
+  if(k==="prem") return r.prem_est!==null ? r.prem_est : r.prem_nav;
+  return r[k];
+}
+function sorted(){
+  const kw = document.getElementById("search").value.trim().toLowerCase();
+  let list = kw ? rows.filter(r=>r.code.includes(kw)||r.name.toLowerCase().includes(kw)) : rows.slice();
+  list.sort((a,b)=>{
+    const va=sortVal(a,sortK), vb=sortVal(b,sortK);
+    const na=va===null||va===undefined, nb=vb===null||vb===undefined;
+    if(na&&nb) return 0; if(na) return 1; if(nb) return -1;
+    return sortDesc ? vb-va : va-vb;
+  });
+  return list;
+}
+function render(){
+  const tb = document.getElementById("tbody");
+  tb.innerHTML = sorted().map(r=>{
+    const v = r.prem_est!==null ? r.prem_est : r.prem_nav;
+    const cls = color(v);
+    const prem = fmtPct(r.prem_nav)+" / "+fmtPct(r.prem_est);
+    return "<tr data-code='"+r.code+"' class='"+cls+"'>"
+      +"<td>"+r.code+"</td><td>"+esc(r.name)+"</td>"
+      +"<td>"+fmtP(r.price)+"</td><td>"+fmtP(r.nav)+"</td>"
+      +"<td>"+(r.gsz?fmtP(r.gsz):"--")+"</td>"
+      +"<td>"+prem+"</td><td>"+fmtPct(r.prem3)+"</td>"
+      +"<td>"+fmtAmt(r.amount)+"</td>"
+      +"<td>"+fmtPct(r.exp_ret)+"</td>"
+      +"<td>"+(r.exp_amt===null?"--":Math.round(r.exp_amt).toLocaleString())+"</td></tr>";
+  }).join("");
+}
+function esc(s){ return String(s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+// ============================================================ 交互
+document.querySelectorAll("th").forEach(th=>{
+  th.addEventListener("click", ()=>{
+    const k = th.dataset.k;
+    if(sortK===k) sortDesc=!sortDesc; else { sortK=k; sortDesc=true; }
+    document.querySelectorAll("th").forEach(x=>x.textContent = HEAD[x.dataset.k]);
+    th.textContent = HEAD[k] + (sortDesc?" ↓":" ↑");
+    render();
+  });
+});
+document.getElementById("search").addEventListener("input", render);
+document.getElementById("btnRefresh").addEventListener("click", refresh);
+
+// 自动刷新
+document.getElementById("autoRefresh").addEventListener("change", e=>{
+  clearInterval(autoTimer);
+  if(e.target.checked){
+    const sec = Math.max(15, +document.getElementById("interval").value||60);
+    autoTimer = setInterval(refresh, sec*1000);
+  }
+});
+
+// 详情弹窗
+document.getElementById("tbody").addEventListener("click", e=>{
+  const tr = e.target.closest("tr"); if(!tr) return;
+  const r = rows.find(x=>x.code===tr.dataset.code); if(!r) return;
+  const v = r.prem_est!==null ? r.prem_est : r.prem_nav;
+  document.getElementById("modalBox").innerHTML =
+    "<h3>"+r.code+" "+esc(r.name)+"</h3><table>"
+    +kv("现价", fmtP(r.price))
+    +kv("最新净值", fmtP(r.nav)+"（"+(r.nav_date||"--")+"）")
+    +kv("估算净值", (r.gsz?fmtP(r.gsz):"无估值")+"（"+(r.gztime||"--")+"）")
+    +kv("净值溢价", fmtPct(r.prem_nav))
+    +kv("估算溢价", fmtPct(r.prem_est))
+    +kv("三日均溢", fmtPct(r.prem3))
+    +kv("成交额", fmtAmt(r.amount))
+    +kv("预计收益率(万元)", fmtPct(r.exp_ret))
+    +kv("预计收益额(元/万元)", r.exp_amt===null?"--":Math.round(r.exp_amt).toLocaleString())
+    +kv("申购状态", r.sgzt||"未知")
+    +kv("赎回状态", r.shzt||"未知")
+    +"</table><p style='margin:14px 0 0'><a target='_blank' href='https://quote.eastmoney.com/"+r.code+".html'>打开东财行情页 ↗</a></p>";
+  document.getElementById("modalBg").classList.add("show");
+});
+function kv(k,v){ return "<tr><td>"+k+"</td><td>"+v+"</td></tr>"; }
+document.getElementById("modalBg").addEventListener("click", e=>{
+  if(e.target===e.currentTarget) e.currentTarget.classList.remove("show");
+});
+
+// 启动
+document.querySelector("th[data-k=prem]").textContent = HEAD.prem+" ↓";
+refresh();
+</script>
+</body>
+</html>
