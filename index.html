@@ -54,7 +54,7 @@ tbody tr:hover{background:#f5f9ff;cursor:pointer}
   <span class="hint">红=溢价 绿=折价 | 点击表头排序 | 点击行看详情</span>
 </div>
 <div class="progress"><div id="pbar"></div></div>
-<div class="status" id="status">点击「刷新数据」开始拉取（首次约 30~90 秒，取决于网络）</div>
+<div class="status" id="status">正在加载 ...</div>
 <div class="wrap" style="overflow-x:auto">
 <table id="tbl">
 <thead><tr>
@@ -62,7 +62,7 @@ tbody tr:hover{background:#f5f9ff;cursor:pointer}
   <th data-k="name">名称</th>
   <th data-k="price">现价</th>
   <th data-k="nav">净值</th>
-  <th data-k="gsz">估算净值</th>
+  <th data-k="gsz" title="天天基金已于2024年下线盘中估值，如接口恢复将自动显示">估算净值</th>
   <th data-k="prem">溢价/估算</th>
   <th data-k="prem3">三日均溢</th>
   <th data-k="amount">成交额(取整)</th>
@@ -72,7 +72,7 @@ tbody tr:hover{background:#f5f9ff;cursor:pointer}
 <tbody id="tbody"></tbody>
 </table>
 </div>
-<div class="footer">数据来源：东方财富 / 天天基金公开接口，可能有延迟或误差，仅供研究参考，不构成投资建议。GitHub Pages 静态部署 · 数据在浏览器本地实时计算。</div>
+<div class="footer">数据来源：东方财富 / 天天基金公开接口；净值快照由 GitHub Action 每日定时抓取（data.json），现价为浏览器实时拉取。数据可能有延迟或误差，仅供研究参考，不构成投资建议。注：基金盘中实时估值已被下线，「估算净值」列暂不可用，恢复后将自动显示。</div>
 
 <div class="modal-bg" id="modalBg"><div class="modal" id="modalBox"></div></div>
 
@@ -80,11 +80,12 @@ tbody tr:hover{background:#f5f9ff;cursor:pointer}
 "use strict";
 // ============================================================ 数据层
 const HEAD = {code:"代码",name:"名称",price:"现价",nav:"净值",gsz:"估算净值",prem:"溢价/估算",prem3:"三日均溢",amount:"成交额",exp_ret:"预计收益率",exp_amt:"预计收益额"};
-let rows = [];            // 全部数据
+let rows = [];
+let dataPack = null;        // 同源 data.json（GitHub Action 生成）
 let sortK = "prem", sortDesc = true;
 let loading = false, autoTimer = null;
 
-// ---- 通用 JSONP（cbName 指定回调参数名，东财行情用 cb，fundmobapi 用 callback）----
+// ---- 通用 JSONP（cbName: 东财行情用 cb，fundmobapi 用 callback）----
 let jsonpSeq = 0;
 function jsonp(url, cbName){
   cbName = cbName || "callback";
@@ -99,8 +100,19 @@ function jsonp(url, cbName){
     document.head.appendChild(s);
   });
 }
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 
-// ---- 1. LOF 实时行情列表 ----
+// ---- 0. 同源净值快照（主数据源，来自本仓库 data.json）----
+async function fetchDataPack(){
+  try{
+    const r = await fetch("data.json", {cache: "no-store"});
+    if(!r.ok) return null;
+    const d = await r.json();
+    return (d && d.funds) ? d : null;
+  }catch(e){ return null; }
+}
+
+// ---- 1. LOF 实时行情列表（现价/成交额）----
 async function fetchSpot(){
   const out = [];
   for(let pn=1; pn<=5; pn++){
@@ -117,39 +129,43 @@ async function fetchSpot(){
   return out;
 }
 
-// ---- 2. 最新净值（批量，50 只/请求）----
+// ---- 2. 最新净值（实时增强源，失败自动回退 data.json）----
 async function fetchNavBatch(codes){
   const map = {};
   for(let i=0;i<codes.length;i+=50){
     const u = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo?plat=Android&appType=ttjj&product=EFund&Version=6.2.8&deviceid=1&Fcodes="+codes.slice(i,i+50).join(",");
-    try{
-      const d = await jsonp(u);
-      (d.Datas||[]).forEach(f=>{
-        if(f.NAV) map[f.FCODE] = {nav:+f.NAV, date:f.PDATE||"", sgzt:f.SGZT||"", shzt:f.SHZT||""};
-      });
-    }catch(e){}
+    for(let attempt=0; attempt<3; attempt++){
+      try{
+        const d = await jsonp(u);
+        const arr = d.Datas || [];
+        if(arr.length){
+          arr.forEach(f=>{ if(f.NAV) map[f.FCODE] = {nav:+f.NAV, date:f.PDATE||"", sgzt:f.SGZT||"", shzt:f.SHZT||""}; });
+          break;
+        }
+        if(d.ErrCode === 0) break; // 正常返回但为空，不再重试
+      }catch(e){}
+      await sleep(500 * (attempt+1));
+    }
   }
   return map;
 }
 
-// ---- 3. 估算净值（fundgz，脚本原生跨域）----
+// ---- 3. 估算净值（fundgz，已大概率下线；先探测再决定是否全量请求）----
 function fetchGz(code){
   return new Promise(resolve=>{
-    const cb = "jsonpgz";
-    const old = window[cb];
     const s = document.createElement("script");
-    const timer = setTimeout(()=>{ window[cb]=old; s.remove(); resolve(null); }, 8000);
-    window[cb] = function(d){
-      clearTimeout(timer); window[cb]=old; s.remove();
+    const timer = setTimeout(()=>{ window.jsonpgz = undefined; s.remove(); resolve(null); }, 8000);
+    window.jsonpgz = function(d){
+      clearTimeout(timer); window.jsonpgz = undefined; s.remove();
       resolve(d && d.gsz ? {gsz:+d.gsz, time:d.gztime||""} : null);
     };
-    s.onerror = ()=>{ clearTimeout(timer); window[cb]=old; s.remove(); resolve(null); };
+    s.onerror = ()=>{ clearTimeout(timer); window.jsonpgz = undefined; s.remove(); resolve(null); };
     s.src = "https://fundgz.1234567.com.cn/js/"+code+".js";
     document.head.appendChild(s);
   });
 }
 
-// ---- 4. 历史净值 / 日K（三日均溢用）----
+// ---- 4. 历史净值 / 日K（三日均溢用，实时增强）----
 async function fetchHistNav(code){
   const u = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNHisNetList?FCODE="+code+"&pageIndex=1&pageSize=8&plat=Android&appType=ttjj&product=EFund&Version=6.2.8&deviceid=1";
   try{
@@ -189,14 +205,19 @@ async function refresh(){
   const st = msg=>document.getElementById("status").textContent = msg;
   const pb = v=>document.getElementById("pbar").style.width = v+"%";
   try{
-    st("正在获取 LOF 列表 ...");
-    const spot = await fetchSpot();
-    if(!spot.length) throw new Error("未获取到 LOF 列表");
+    st("正在加载净值快照 (data.json) ...");
+    dataPack = await fetchDataPack();
     pb(5);
 
-    st("正在获取净值（批量）...");
-    const navMap = await fetchNavBatch(spot.map(f=>f.code));
+    st("正在获取 LOF 实时行情 ...");
+    const spot = await fetchSpot();
+    if(!spot.length) throw new Error("未获取到 LOF 列表（行情接口不可达）");
     pb(15);
+
+    st("正在获取净值（实时接口，失败自动用快照）...");
+    const navMap = await fetchNavBatch(spot.map(f=>f.code));
+    const navLive = Object.keys(navMap).length;
+    pb(25);
 
     rows = spot.map(f=>{
       const n = navMap[f.code] || {};
@@ -205,24 +226,57 @@ async function refresh(){
               gsz:null, gztime:"", histNav:[], kline:[], prem3:null};
     });
 
-    // 每只基金：估算净值 + 历史净值 + 日K
-    await pool(rows, async r=>{
-      const [gz, hn, kl] = await Promise.all([
-        fetchGz(r.code), fetchHistNav(r.code), fetchKline(r.mkt+"."+r.code)
-      ]);
-      if(gz){ r.gsz = gz.gsz; r.gztime = gz.time; }
-      r.histNav = hn; r.kline = kl;
-    }, 12, (d,t)=>{ st("拉取数据中 ... "+d+" / "+t); pb(15 + 85*d/t); });
+    // 探测估算净值接口是否存活（2024年后大概率已下线）
+    st("探测估算净值接口 ...");
+    const probe = await fetchGz(rows[0].code);
+    const gzAlive = !!probe;
 
+    // 每只基金：历史净值 + 日K（+估算，若存活）
+    await pool(rows, async r=>{
+      const tasks = [fetchHistNav(r.code), fetchKline(r.mkt+"."+r.code)];
+      if(gzAlive) tasks.push(fetchGz(r.code));
+      const [hn, kl, gz] = await Promise.all(tasks);
+      r.histNav = hn; r.kline = kl;
+      if(gz){ r.gsz = gz.gsz; r.gztime = gz.time; }
+    }, 12, (d,t)=>{ st("拉取数据中 ... "+d+" / "+t); pb(25 + 70*d/t); });
+
+    mergePack();     // 实时接口缺失的，用同源快照补齐
     calc();
     render();
     pb(100);
-    st("完成：共 "+rows.length+" 只 LOF · 更新于 "+new Date().toLocaleTimeString("zh-CN"));
+    st("完成：共 "+rows.length+" 只 · 净值来源:"+(navLive>0?"实时接口":"服务器快照")
+      + (dataPack?("（快照更新于 "+dataPack.updated+"）"):"（无快照：请到 Actions 运行 Update LOF data）")
+      + " · 更新于 "+new Date().toLocaleTimeString("zh-CN"));
   }catch(e){
-    st("刷新失败："+e.message+"（网络受限或接口变动，稍后重试）");
+    // 实时行情不可达时，至少把快照数据展示出来
+    if(dataPack && Object.keys(dataPack.funds).length){
+      rows = Object.keys(dataPack.funds).map(code=>{
+        const p = dataPack.funds[code];
+        return {code, mkt:p.mkt, name:p.name, price:null, amount:null,
+                nav:p.nav, nav_date:p.nav_date, sgzt:p.sgzt, shzt:p.shzt,
+                gsz:null, gztime:"", histNav:[], kline:[], prem3:p.prem3};
+      });
+      calc(); render();
+      st("实时行情不可达，已显示服务器快照（更新于 "+dataPack.updated+"）："+e.message);
+    }else{
+      st("刷新失败："+e.message+"（网络受限或接口变动，稍后重试）");
+    }
   }
   btn.disabled = false;
   loading = false;
+}
+
+// ---- 快照合并（仅补缺失字段，不覆盖实时数据）----
+function mergePack(){
+  if(!dataPack || !dataPack.funds) return;
+  rows.forEach(r=>{
+    const p = dataPack.funds[r.code];
+    if(!p) return;
+    if(r.nav===null && p.nav){ r.nav = p.nav; r.nav_date = p.nav_date||""; }
+    if(r.prem3===null && p.prem3!=null) r.prem3 = p.prem3;
+    if(!r.sgzt && p.sgzt) r.sgzt = p.sgzt;
+    if(!r.shzt && p.shzt) r.shzt = p.shzt;
+  });
 }
 
 // ---- 指标计算 ----
@@ -231,9 +285,11 @@ function calc(){
     r.prem_nav = (r.price && r.nav) ? r.price/r.nav - 1 : null;
     r.prem_est = (r.price && r.gsz) ? r.price/r.gsz - 1 : null;
     // 三日均溢：最近3个交易日 (收盘/当日净值-1) 均值
-    const navByDate = {}; r.histNav.forEach(h=>navByDate[h.date]=h.nav);
-    const ps = r.kline.slice(0,3).filter(k=>navByDate[k.date]).map(k=>k.close/navByDate[k.date]-1);
-    r.prem3 = ps.length ? ps.reduce((a,b)=>a+b,0)/ps.length : null;
+    if(r.prem3===null){
+      const navByDate = {}; r.histNav.forEach(h=>navByDate[h.date]=h.nav);
+      const ps = r.kline.slice(0,3).filter(k=>navByDate[k.date]).map(k=>k.close/navByDate[k.date]-1);
+      r.prem3 = ps.length ? ps.reduce((a,b)=>a+b,0)/ps.length : null;
+    }
     const base = r.gsz || r.nav;
     r.exp_ret = (r.price && base) ? base/r.price - 1 : null;
     r.exp_amt = r.exp_ret===null ? null : r.exp_ret*10000;
@@ -273,7 +329,7 @@ function render(){
     const prem = fmtPct(r.prem_nav)+" / "+fmtPct(r.prem_est);
     return "<tr data-code='"+r.code+"' class='"+cls+"'>"
       +"<td>"+r.code+"</td><td>"+esc(r.name)+"</td>"
-      +"<td>"+fmtP(r.price)+"</td><td>"+fmtP(r.nav)+"</td>"
+      +"<td>"+fmtP(r.price)+"</td><td title='净值日期:"+(r.nav_date||"--")+"'>"+fmtP(r.nav)+"</td>"
       +"<td>"+(r.gsz?fmtP(r.gsz):"--")+"</td>"
       +"<td>"+prem+"</td><td>"+fmtPct(r.prem3)+"</td>"
       +"<td>"+fmtAmt(r.amount)+"</td>"
@@ -288,7 +344,10 @@ document.querySelectorAll("th").forEach(th=>{
   th.addEventListener("click", ()=>{
     const k = th.dataset.k;
     if(sortK===k) sortDesc=!sortDesc; else { sortK=k; sortDesc=true; }
-    document.querySelectorAll("th").forEach(x=>x.textContent = HEAD[x.dataset.k]);
+    document.querySelectorAll("th").forEach(x=>{
+      x.textContent = HEAD[x.dataset.k];
+      if(x.dataset.k==="gsz") x.title = "天天基金已于2024年下线盘中估值，如接口恢复将自动显示";
+    });
     th.textContent = HEAD[k] + (sortDesc?" ↓":" ↑");
     render();
   });
@@ -309,12 +368,11 @@ document.getElementById("autoRefresh").addEventListener("change", e=>{
 document.getElementById("tbody").addEventListener("click", e=>{
   const tr = e.target.closest("tr"); if(!tr) return;
   const r = rows.find(x=>x.code===tr.dataset.code); if(!r) return;
-  const v = r.prem_est!==null ? r.prem_est : r.prem_nav;
   document.getElementById("modalBox").innerHTML =
     "<h3>"+r.code+" "+esc(r.name)+"</h3><table>"
     +kv("现价", fmtP(r.price))
     +kv("最新净值", fmtP(r.nav)+"（"+(r.nav_date||"--")+"）")
-    +kv("估算净值", (r.gsz?fmtP(r.gsz):"无估值")+"（"+(r.gztime||"--")+"）")
+    +kv("估算净值", (r.gsz?fmtP(r.gsz):"已下线")+"（"+(r.gztime||"--")+"）")
     +kv("净值溢价", fmtPct(r.prem_nav))
     +kv("估算溢价", fmtPct(r.prem_est))
     +kv("三日均溢", fmtPct(r.prem3))
@@ -323,7 +381,7 @@ document.getElementById("tbody").addEventListener("click", e=>{
     +kv("预计收益额(元/万元)", r.exp_amt===null?"--":Math.round(r.exp_amt).toLocaleString())
     +kv("申购状态", r.sgzt||"未知")
     +kv("赎回状态", r.shzt||"未知")
-    +"</table><p style='margin:14px 0 0'><a target='_blank' href='https://quote.eastmoney.com/"+r.code+".html'>打开东财行情页 ↗</a></p>";
+    +"</table><p style='margin:14px 0 0'><a target='_blank' href='https://fund.eastmoney.com/"+r.code+".html'>天天基金档案 ↗</a>　<a target='_blank' href='https://quote.eastmoney.com/"+r.code+".html'>东财行情 ↗</a></p>";
   document.getElementById("modalBg").classList.add("show");
 });
 function kv(k,v){ return "<tr><td>"+k+"</td><td>"+v+"</td></tr>"; }
